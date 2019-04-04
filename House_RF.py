@@ -9,34 +9,57 @@ Housing Prices
 import pandas as pd
 import numpy as np
 import seaborn as sns
+from matplotlib import pyplot as plt
+
+########## Exploratory Data Analysis ##############
+test=pd.read_csv("C:/Users/w10007346/Dropbox/Kaggle/House_Comp/test.csv")
+train=pd.read_csv("C:/Users/w10007346/Dropbox/Kaggle/House_Comp/train.csv")
+
+# the response variable 
+sns.distplot(train.SalePrice)
+train.SalePrice.describe()
+# how many features
+len(train.columns.values)
+# plot heatmap of features
+import os
+#set dir
+os.chdir('C:/Users/w10007346/Dropbox/Kaggle/House_Comp')
+
+mask = np.zeros_like(train.corr())
+mask[np.triu_indices_from(mask)]=True
+cmap = sns.diverging_palette(180, 30, as_cmap=True)
+with sns.axes_style('white'):
+    fig, ax = plt.subplots(figsize=(13,11))
+    heat=sns.heatmap(train.corr(), vmax=.8, mask=mask, cmap=cmap, cbar_kws={'shrink':.5}, linewidth=.01);
+       
+fig=heat.get_figure()
+#save
+fig.savefig('heatfig.png', dpi=800, bbox_inches="tight")
 
 ########## Data Cleaning #############################
-test=pd.read_csv("C:/Users/w10007346/Dropbox/Kaggle/House_Comp/test.csv")
-#get rid of id column
-test.drop("Id", axis = 1, inplace = True)
+
 # identify test versus train
+test.columns.values
+test.drop("Id", axis = 1, inplace = True)
 test['set']=np.tile('test',len(test))
 
-train=pd.read_csv("C:/Users/w10007346/Dropbox/Kaggle/House_Comp/train.csv")
+
 train.drop("Id", axis = 1, inplace = True)
 train['set']=np.tile('train',len(train))
 
 # combine test and training datasets to remove NAs in one sweep
-
 df=train.append(test, ignore_index=True)
-
 
 df.columns.values
 
 df.head()
 
-sns.distplot(df.SalePrice.dropna())
 
 #are there any NAs
 df.isnull().values.any() # of course
 
 #how many in each feature
-nas=df.isnull().sum()
+nas=df.isnull().sum().sort_values(ascending=False)
 hasnas=nas[nas!=0]
 hasnas
 
@@ -48,6 +71,7 @@ df=df.drop(['Utilities'], axis=1)
 
 # MSZoning
 df.MSZoning.describe()
+pd.Series(df.MSZoning).value_counts().plot('bar')
 # vastly most common is RL replace missing with RL
 df.MSZoning=df['MSZoning'].fillna(df['MSZoning'].mode()[0])
 
@@ -132,102 +156,160 @@ df.YrSold.describe()
 df.YrSold=df.YrSold.astype(str)
 df.MoSold=df.MoSold.astype(str)
 
-
-
-# get rid of needless columns
-df=df.drop('set', axis=1)
-resp=train.SalePrice # store response
+# store response and remove from aggregate data set
+resp=train.SalePrice 
 df=df.drop('SalePrice', axis=1)
 
 
-# dummy code categorical variables 
-df=pd.get_dummies(df)
-dumtrain=df[:train.shape[0]]
-dumtest=df[:test.shape[0]]
-
+########## check for skewed features #########################################
 # plot sale price
 sns.distplot(resp) # positively skewed 
 resp=np.log1p(resp) # transform by log(1+x)
 sns.distplot(resp) 
 
-# split training data into validation and train
-from sklearn.model_selection import train_test_split
-#train_X, val_X, train_y, val_y = train_test_split(dumtrain.drop('SalePrice',axis=1), dumtrain.SalePrice, random_state = 0)
+# transform features by a flexible box cox
+num_feats=df.dtypes[df.dtypes!='object'].index
+skew_feats=df[num_feats].skew().sort_values(ascending=False)
+skewness=pd.DataFrame({'Skew':skew_feats})
+skewness=skewness[abs(skewness)>0.75].dropna()
+skewed_features=skewness.index
+
+# add one to all skewed features 
+df[skewed_features]+=1
+# conduct boxcox transformation
+from scipy.stats import boxcox
+
+for i in skewed_features:
+    df[i],lmbda=boxcox(df[i], lmbda=None)
+
+# check to see if skew decreased    
+num_feats=df.dtypes[df.dtypes!='object'].index
+skew_feats=df[num_feats].skew().sort_values(ascending=False)
+skewness=pd.DataFrame({'Skew':skew_feats})
+skewness=skewness[abs(skewness)>0.75].dropna()
+    
+    
+# dummy code categorical variables 
+df=pd.get_dummies(df)
+df.columns.values
+
+#  subset train and test sets from df that now has transformed features
+dumtest=df.loc[df['set_test']==1]
+dumtrain=df.loc[df['set_train']==1]
+
+# drop indices for set and train sets
+dumtest=dumtest.drop(['set_test','set_train'], axis=1)
+dumtrain=dumtrain.drop(['set_test','set_train'], axis=1)
+
+##################  Modeling  ###################################
 
 ############## Random Forest Regressor ##########################
 from sklearn.ensemble import RandomForestRegressor
 
-#model=RandomForestRegressor(random_state=1)
-#model.fit(train_X, train_y)
-#
-#val_predictions=model.predict(val_X)
-#
-#from sklearn.metrics import mean_absolute_error
-#print(mean_absolute_error(val_y, val_predictions)) # 0.10056
-#
-#results=pd.concat([val_y,pd.Series(val_predictions)], axis=1).dropna()
-#results.columns.values
-#results.columns=['Observed', 'Predicted']
-#results.plot.scatter('Observed', 'Predicted')
-# results are fairly poor
+# the model prior to hyperparameter optimization
+RFR=RandomForestRegressor(random_state=1)
+
+#### use random search to identify the best hyperparameters using Kfold CV
+# number of trees 
+n_estimators=[int(x) for x in np.linspace(start = 200, stop = 2000, num = 10)]
+# max number of features to consider at every split
+max_features = ['auto', 'sqrt', 'log2']
+# max number of levels in tree
+max_depth = [int(x) for x in np.linspace(10, 110, num = 11)]
+max_depth.append(None)
+# Minimum number of samples required to split a node
+min_samples_split = [2, 5, 10]
+# Minimum number of samples required at each leaf node
+min_samples_leaf = [1, 2, 4]
+# Method of selecting samples for training each tree
+bootstrap = [True, False]
+# grid to feed gridsearch
+grid_param = {'n_estimators': n_estimators,
+              'max_features': max_features,
+               'max_depth': max_depth,
+               'min_samples_split': min_samples_split,
+               'min_samples_leaf': min_samples_leaf,
+               'bootstrap': bootstrap}
+
+# Random search training
+from sklearn.model_selection import RandomizedSearchCV
+RFR_random = RandomizedSearchCV(estimator = RFR, param_distributions = grid_param, n_iter = 500,
+                               cv = 5, verbose=2, random_state=42, n_jobs = -1)
+
+RFR_random.fit(dumtrain, resp) 
+print(RFR_random.best_params_)
+
+# {'n_estimators': 2000, 'min_samples_split': 2, 'min_samples_leaf': 1, 
+# 'max_features': 'sqrt', 'max_depth': None, 'bootstrap': False}
 
 
-########## check for skewed features #########################################
-num_feats=df.dtypes[df.dtypes!='object'].index
-
-skew_feats=df[num_feats].skew().sort_values(ascending=False)
-skewness=pd.DataFrame({'Skew':skew_feats})
-skewness=skewness[abs(skewness)>0.75].dropna()
-
-from scipy.special import boxcox1p
-skewed_features=skewness.index
-lam=0.15
-
-for i in skewed_features:
-    df[i]=boxcox1p(df[i],lam)
-
-######## Try random forest regressor with transformed data ############
-#  subset train and test sets from df that now has transformed features
-dumtrain=df[:train.shape[0]]
-dumtest=df[:test.shape[0]]
-
-len(dumtest.columns.values)
-len(dumtrain.columns.values)
+Best_RFR=RandomForestRegressor(n_estimators=2000, min_samples_split=2, min_samples_leaf=1,
+                               max_features='sqrt', max_depth=None, bootstrap=False)
 
 
-# plot sale price
-sns.distplot(resp) # no longer skewed
-
-
-############ Now use Kfold cross validation  ################
-from sklearn.model_selection import KFold, cross_val_score, train_test_split
-
-n_folds = 5
-
-def rmsle_cv(model):
+# use root mean squared error to measure accuracy of model on through cross validation
+from sklearn.model_selection import KFold, cross_val_score
+n_folds=5
+def rmse_cv(model):
     kf = KFold(n_folds, shuffle=True, random_state=42).get_n_splits(dumtrain)
     rmse= np.sqrt(-cross_val_score(model, dumtrain, resp, scoring="neg_mean_squared_error", cv = kf))
-    return(rmse)
-
-# random forest 
-RFR=RandomForestRegressor(random_state=1)
-score=rmsle_cv(RFR)
-score.mean() #.15
-
-# gradient boosting regression
-from sklearn.ensemble import GradientBoostingRegressor
-Boost = GradientBoostingRegressor(n_estimators=3000, learning_rate=0.05,
-                                   max_depth=4, max_features='sqrt',
-                                   min_samples_leaf=15, min_samples_split=10, 
-                                   loss='huber', random_state =5)
-
-score=rmsle_cv(Boost)
-score.mean() #.12
-
-# fit the training dataset on the model
-BoostMd=Boost.fit(dumtrain,resp)
-
-# predictions for test set
-np.expm1(BoostMd.predict(dumtest))
+    return(rmse.mean())
+    
+rmse_cv(Best_RFR) # 0.1499
 
 
+############# XG Boosting Regression ################################
+from xgboost import XGBRegressor
+
+Boost = XGBRegressor(random_seed=1)
+
+# optimize hyperparameters
+#### use random search to identify the best hyperparameters using Kfold CV
+# learning rate
+
+# number of trees 
+n_estimators=[int(x) for x in np.linspace(start = 200, stop = 2000, num = 10)]
+# percentage of samples per tree
+subsample = [.6,.7,.8,.9,1]
+# max number of levels in tree
+max_depth = [int(x) for x in np.linspace(10, 50, num = 10)]
+#  minimum sum of weights of all observations required in a child
+Min_child_weight = [1,3,5,7]
+# percentage of features used per tree
+colsample_bytree=[.6,.7,.8,.9,1]
+# learning rate or step size shrinkage
+learning_rate=[.01,.015,.025,.05,.1]
+# Minimum loss reduction required to make a split
+gamma = [.05,.08,.1,.3,.5,.7,.9,1]
+# grid to feed gridsearch
+rand_param = {'n_estimators': n_estimators,
+              'subsample': subsample,
+               'max_depth': max_depth,
+               'colsample_bytree': colsample_bytree,
+               'min_child_weight': Min_child_weight,
+               'learning_rate': learning_rate,
+               'gamma': gamma}
+
+Boost_random = RandomizedSearchCV(estimator = Boost, param_distributions = rand_param, n_iter = 500,
+                               cv = 5, verbose=2, random_state=42, n_jobs = -1)
+
+Boost_random.fit(dumtrain, resp) 
+print(Boost_random.best_params_)
+# {'subsample': 0.6, 'n_estimators': 1800, 'min_child_weight': 3, 'max_depth': 50, 
+# 'learning_rate': 0.015, 'gamma': 0.05, 'colsample_bytree': 0.6}
+
+# model with the optimum hyperparameters
+Best_Boost = XGBRegressor(subsample=.6, n_estimators=1800, min_child_weight=3, max_depth=50,
+                          learning_rate=.015, gamma=.05, colsample_bytree=.6)
+# evaluate rmse
+rmse_cv(Best_Boost) #0.1308
+
+# use exponential function to get appropriately scaled sale prices
+Best_Boost.fit(dumtrain,resp)
+ypred=np.expm1(Best_Boost.predict(dumtest))
+
+sub=pd.DataFrame()
+test=pd.read_csv("C:/Users/w10007346/Dropbox/Kaggle/House_Comp/test.csv")
+sub['Id']=test['Id']
+sub['SalePrice']=ypred
+sub.to_csv('KaggleSub.csv', index=False)
